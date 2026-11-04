@@ -65,6 +65,12 @@ const SLACK_MEMBERS: SlackMember[] = [
 const membersWithGraceStatus = (profile: SlackMember['profile']): SlackMember[] =>
   SLACK_MEMBERS.map(member => (member.id === 'U_GRACE' ? { ...member, profile } : member))
 
+/** The roster with the given members' status emoji swapped. */
+const membersWithStatuses = (statuses: Record<string, string>): SlackMember[] =>
+  SLACK_MEMBERS.map(member =>
+    member.id in statuses ? { ...member, profile: { status_emoji: statuses[member.id] } } : member
+  )
+
 const startStubServer = async (existingNotes: object[], slackMembers: SlackMember[], noteWriteStatus: number) => {
   const requests: StubRequest[] = []
 
@@ -288,6 +294,109 @@ describe.concurrent('reconciling with an existing comment', () => {
     expect(exitCode).toBe(0)
     expect(updates).toHaveLength(1)
     expect(updates[0].path).toBe(`${notesPath}/99`)
+  })
+})
+
+describe.concurrent('when too few reviewers are available', () => {
+  const STAND_IN = 'standing in because no senior developer is available'
+
+  it('stands a developer in for the senior slot when no maintainer is available', async () => {
+    const extraContributorConfigPath = path.join(fixtureDir, 'reviewers-extra-contributor.json')
+    await writeFile(
+      extraContributorConfigPath,
+      JSON.stringify({
+        reviewers: [
+          ...REVIEWERS.reviewers,
+          {
+            name: 'Margaret Contributor',
+            email: 'margaret@example.com',
+            userId: 5,
+            slackUserId: 'U_MARGARET',
+            roles: ['contributor'],
+          },
+        ],
+      })
+    )
+
+    const { exitCode, posted, body } = await runRoulette({
+      configPath: extraContributorConfigPath,
+      slackMembers: membersWithStatuses({ U_LINUS: ':palm_tree:' }),
+    })
+
+    expect(exitCode).toBe(0)
+    expect(posted).toHaveLength(1)
+    expect(body).toMatch(
+      new RegExp(`\\| Senior Developers \\| (Barbara|Margaret) Contributor \\(\\w+@example\\.com\\), ${STAND_IN} \\|`)
+    )
+    expect(body).toContain('Barbara Contributor')
+    expect(body).toContain('Margaret Contributor')
+    expect(body).toContain('selected two reviewers')
+    expect(body).not.toContain('Linus Maintainer')
+  })
+
+  it("does not stand someone in when an available maintainer's selectionChance misses", async () => {
+    const unluckyConfigPath = path.join(fixtureDir, 'reviewers-unlucky-maintainer.json')
+    await writeFile(
+      unluckyConfigPath,
+      JSON.stringify({
+        reviewers: REVIEWERS.reviewers.map(reviewer =>
+          reviewer.name === 'Linus Maintainer' ? { ...reviewer, selectionChance: 1 } : reviewer
+        ),
+      })
+    )
+
+    const { exitCode, body } = await runRoulette({ configPath: unluckyConfigPath })
+
+    expect(exitCode).toBe(0)
+    expect(body).toContain('| Senior Developers | Linus Maintainer (linus@example.com) |')
+    expect(body).not.toContain(STAND_IN)
+  })
+
+  it('names a single reviewer when only one person is available', async () => {
+    const { exitCode, posted, body } = await runRoulette({
+      configPath,
+      slackMembers: membersWithStatuses({ U_LINUS: ':palm_tree:' }),
+    })
+
+    expect(exitCode).toBe(0)
+    expect(posted).toHaveLength(1)
+    expect(body).toContain(`| Senior Developers | Barbara Contributor (barbara@example.com), ${STAND_IN} |`)
+    expect(body).toContain('| All Developers | No one else is available |')
+    expect(body).toContain('selected a reviewer')
+  })
+
+  it('fails without writing a comment when nobody is available', async () => {
+    const { exitCode, output, writes } = await runRoulette({
+      configPath,
+      slackMembers: membersWithStatuses({ U_LINUS: ':palm_tree:', U_BARBARA: ':ooo:' }),
+    })
+
+    expect(exitCode).not.toBe(0)
+    expect(output).toContain('No reviewers are available')
+    expect(writes).toHaveLength(0)
+  })
+
+  it('leaves an existing comment alone without failing when nobody is available', async () => {
+    const { exitCode, writes } = await runRoulette({
+      configPath,
+      existingNotes: noteFromBot('[ ]'),
+      slackMembers: membersWithStatuses({ U_LINUS: ':palm_tree:', U_BARBARA: ':ooo:' }),
+    })
+
+    expect(exitCode).toBe(0)
+    expect(writes).toHaveLength(0)
+  })
+
+  it('fails without replacing the comment when a re-roll finds nobody available', async () => {
+    const { exitCode, output, writes } = await runRoulette({
+      configPath,
+      existingNotes: noteFromBot('[x]'),
+      slackMembers: membersWithStatuses({ U_LINUS: ':palm_tree:', U_BARBARA: ':ooo:' }),
+    })
+
+    expect(exitCode).not.toBe(0)
+    expect(output).toContain('No reviewers are available')
+    expect(writes).toHaveLength(0)
   })
 })
 

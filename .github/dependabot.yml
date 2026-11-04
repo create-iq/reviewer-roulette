@@ -9,3 +9,7 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+    ignore:
+      # Its major has to match the Node pinned in mise.toml; move both together by hand.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
