@@ -3,6 +3,7 @@
 // Slack is stubbed on a live local port. With the proxy pointed at a dead port
 // the stub must NOT be reached; with no proxy set it MUST be. Running both is
 // the point — "it failed" alone would also be true if the client were simply broken.
+// GitLab's notes are read before Slack is called, so the stub answers those with an empty list.
 
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
@@ -11,10 +12,11 @@ const runWith = async proxyUrl => {
   let reachedStub = false
 
   const stub = createServer((req, res) => {
-    reachedStub = true
+    const isGitlab = req.url?.startsWith('/gitlab/')
+    reachedStub ||= !isGitlab
     req.resume()
     res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ ok: true, members: [] }))
+    res.end(JSON.stringify(isGitlab ? [] : { ok: true, members: [] }))
   })
   await new Promise(resolve => stub.listen(0, '127.0.0.1', resolve))
 
@@ -24,7 +26,9 @@ const runWith = async proxyUrl => {
       REVIEWER_CONFIG: '/dev/null',
       REVIEWER_BOT_USERNAME: 'bot',
       REVIEWER_BOT_SLACK_TOKEN: 'xoxb-stub',
+      PROJECT_REVIEWER_BOT_PAT: 'stub-pat',
       SLACK_API_URL: `http://127.0.0.1:${stub.address().port}/`,
+      GITLAB_API_URL: `http://127.0.0.1:${stub.address().port}/gitlab`,
       GITLAB_USER_ID: '1',
       ...(proxyUrl ? { HTTPS_PROXY: proxyUrl } : { HTTPS_PROXY: '' }),
     },

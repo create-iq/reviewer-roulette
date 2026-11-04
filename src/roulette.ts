@@ -142,7 +142,7 @@ const filterReviewersWhoAreAway = (reviewers: Reviewer[], slackUsers: Member[], 
   )
 
   console.log(
-    `Eligible reviewers after removing away, author and filtering by chance: ${JSON.stringify(
+    `Reviewers after removing the author and anyone away: ${JSON.stringify(
       reviewersWithoutAuthorAndPeopleAway.map(reviewer => reviewer.name)
     )}`
   )
@@ -181,70 +181,13 @@ const selectReviewersBasedOnChance = (reviewers: Reviewer[]) => {
   return reviewersPostChanceCalculations
 }
 
-const getRandomReviewer = (array: Reviewer[]) => {
+const getRandomReviewer = (array: Reviewer[]): Reviewer | undefined => {
   return array[Math.floor(Math.random() * array.length)]
 }
 
+const formatReviewer = (reviewer: Reviewer) => `${reviewer.name} (${reviewer.email})`
+
 const runReviewRoulette = async () => {
-  const slackMembers: Member[] = await getAllSlackUsers()
-
-  const reviewerDataRaw = await fs.readFile(config.reviewerDataFile, 'utf-8')
-  const reviewerData: ReviewerData = JSON.parse(reviewerDataRaw)
-
-  const startedPipelineUserId = Number.parseInt(requiredEnv('GITLAB_USER_ID'), 10)
-
-  const reviewersWithoutAuthor = reviewerData.reviewers.filter(item => item.userId !== startedPipelineUserId)
-
-  const reviewersSelectedBasedOnChance = selectReviewersBasedOnChance(reviewersWithoutAuthor)
-
-  const awayEmojis = new Set((reviewerData.awayEmojis ?? defaultAwayEmojis).map(normaliseEmojiName))
-
-  console.log(`Away emojis: ${JSON.stringify([...awayEmojis])}`)
-
-  const reviewersWithoutAuthorAndPeopleAway = filterReviewersWhoAreAway(
-    reviewersSelectedBasedOnChance,
-    slackMembers,
-    awayEmojis
-  )
-
-  // Don't include the pipeline/MR creator in the list of possible reviewers
-  const maintainers = reviewersWithoutAuthorAndPeopleAway.filter(item => item.roles.includes('maintainer'))
-
-  const allDevelopers = reviewersWithoutAuthorAndPeopleAway
-
-  const randomMaintainer = getRandomReviewer(maintainers)
-
-  // Remove the chosen maintainer from the list of all devs and pick a random one
-  const randomAllDeveloper = getRandomReviewer(allDevelopers.filter(item => item.userId !== randomMaintainer.userId))
-
-  console.log(`Rand Maintainer = ${JSON.stringify(randomMaintainer)}`)
-  console.log(`Rand All Dev = ${JSON.stringify(randomAllDeveloper)}`)
-
-  // The away set is mostly Slack custom emoji, which GitLab renders as literal `:name:` text, so
-  // the comment describes the rule rather than listing them.
-  const awayEmojiSentence =
-    awayEmojis.size > 0 ? ' (the bot skips anyone whose Slack status marks them as out of office)' : ''
-
-  const gitlabCommentBody = `
-## :wheel_of_dharma: Reviewer Roulette
-
-To spread load more evenly across eligible reviewers and to enable speedy review the Roulette Bot has randomly selected two reviewers for this MR.
-
-You can make different choices if you think someone else would be better-suited or if someone is away${awayEmojiSentence}. Other people are free to review if they'd like to as well.
-
-Once you've decided who will review this merge request **please assign them as a reviewer!** Roulette Bot does not do this automatically.
-
-| Reviewer Category | Name |
-| ------ | ------ |
-| Senior Developers | ${randomMaintainer.name} (${randomMaintainer.email}) |
-| All Developers | ${randomAllDeveloper.name} (${randomAllDeveloper.email}) |
-
-If you'd like the [reviewer roulette job](${process.env.CI_JOB_URL}) that generated this message to get two new random approvers check the box below and rerun it in the pipeline.
-- [ ] Give me two new approvers on the next push / job retry
-
-How do I review / What do I do if I've been named as a reviewer? An official guide is coming very soon, in the mean time pair up with the Senior Developer reviewer and ask for some tips if you'd like some guidance.
-`
-
   const gitlabAuthHeaders: Record<string, string> = { 'PRIVATE-TOKEN': requiredEnv('PROJECT_REVIEWER_BOT_PAT') }
 
   const gitlabApiUrl = process.env.GITLAB_API_URL
@@ -293,47 +236,106 @@ How do I review / What do I do if I've been named as a reviewer? An official gui
 
   console.log(`Previous Comment Id = ${previousNote?.id}`)
 
-  const replaceNote = !!previousNote?.body.includes('- [x] Give me two')
-
-  if (!previousNote || replaceNote) {
-    const createOrUpdateNote = async (replace: boolean) => {
-      const urlEncodedBody = encodeURIComponent(gitlabCommentBody)
-
-      const validReplace = previousNote && replace
-
-      const { present: actionPresentTense, past: actionPastTense } = validReplace
-        ? {
-            present: 'Replacing',
-            past: 'Replaced',
-          }
-        : { present: 'Creating new', past: 'Created new' }
-
-      console.log(`${actionPresentTense} note...`)
-
-      const method = validReplace ? 'PUT' : 'POST'
-      const urlPrefix = validReplace
-        ? `${gitlabApiUrl}/api/v4/projects/${ciProjectId}/merge_requests/${ciMergeRequestIId}/notes/${previousNote.id}`
-        : `${gitlabApiUrl}/api/v4/projects/${ciProjectId}/merge_requests/${ciMergeRequestIId}/notes`
-
-      const writeResponse = await fetch(`${urlPrefix}?body=${urlEncodedBody}`, {
-        headers: gitlabAuthHeaders,
-        method: method,
-      })
-
-      if (!writeResponse.ok) {
-        console.error(`GitLab API error: ${writeResponse.status} ${writeResponse.statusText}`)
-        console.error(`Failed to ${method} the reviewer note. No reviewers have been requested.`)
-        process.exit(1)
-      }
-
-      const jsonData: NoteResponse = await writeResponse.json()
-      console.log(`${actionPastTense} comment id = ${jsonData.id}`)
-    }
-
-    await createOrUpdateNote(!!previousNote && replaceNote)
-  } else {
+  // Checked before selecting anyone, so a run that would find nobody available cannot fail the job
+  // on a merge request whose reviewers were already named.
+  if (previousNote && !previousNote.body.includes('- [x] Give me two')) {
     console.log(`Previous note exists (ID: ${previousNote.id}) and retry wasn't ticked. Doing nothing.`)
+    return
   }
+
+  const slackMembers: Member[] = await getAllSlackUsers()
+
+  const reviewerDataRaw = await fs.readFile(config.reviewerDataFile, 'utf-8')
+  const reviewerData: ReviewerData = JSON.parse(reviewerDataRaw)
+
+  const startedPipelineUserId = Number.parseInt(requiredEnv('GITLAB_USER_ID'), 10)
+
+  const reviewersWithoutAuthor = reviewerData.reviewers.filter(item => item.userId !== startedPipelineUserId)
+
+  const awayEmojis = new Set((reviewerData.awayEmojis ?? defaultAwayEmojis).map(normaliseEmojiName))
+
+  console.log(`Away emojis: ${JSON.stringify([...awayEmojis])}`)
+
+  // Away comes before chance, so the chance bypass only counts people who can actually review.
+  const reviewersWithoutAuthorAndPeopleAway = filterReviewersWhoAreAway(
+    reviewersWithoutAuthor,
+    slackMembers,
+    awayEmojis
+  )
+
+  const eligibleReviewers = selectReviewersBasedOnChance(reviewersWithoutAuthorAndPeopleAway)
+
+  const maintainers = eligibleReviewers.filter(item => item.roles.includes('maintainer'))
+
+  const seniorReviewer = getRandomReviewer(maintainers) ?? getRandomReviewer(eligibleReviewers)
+
+  if (!seniorReviewer) {
+    console.error(
+      'No reviewers are available: everyone in the reviewer config is either the merge request author or away in Slack. Choose reviewers by hand.'
+    )
+    process.exit(1)
+  }
+
+  const seniorIsStandIn = maintainers.length === 0
+
+  const otherReviewer = getRandomReviewer(eligibleReviewers.filter(item => item.userId !== seniorReviewer.userId))
+
+  console.log(`Senior reviewer = ${JSON.stringify(seniorReviewer)}${seniorIsStandIn ? ' (stand-in)' : ''}`)
+  console.log(`Other reviewer = ${JSON.stringify(otherReviewer)}`)
+
+  // The away set is mostly Slack custom emoji, which GitLab renders as literal `:name:` text, so
+  // the comment describes the rule rather than listing them.
+  const awayEmojiSentence =
+    awayEmojis.size > 0 ? ' (the bot skips anyone whose Slack status marks them as out of office)' : ''
+
+  const seniorCell = seniorIsStandIn
+    ? `${formatReviewer(seniorReviewer)}, standing in because no senior developer is available`
+    : formatReviewer(seniorReviewer)
+
+  const gitlabCommentBody = `
+## :wheel_of_dharma: Reviewer Roulette
+
+To spread load more evenly across eligible reviewers and to enable speedy review the Roulette Bot has randomly selected ${otherReviewer ? 'two reviewers' : 'a reviewer'} for this MR.
+
+You can make different choices if you think someone else would be better-suited or if someone is away${awayEmojiSentence}. Other people are free to review if they'd like to as well.
+
+Once you've decided who will review this merge request **please assign them as a reviewer!** Roulette Bot does not do this automatically.
+
+| Reviewer Category | Name |
+| ------ | ------ |
+| Senior Developers | ${seniorCell} |
+| All Developers | ${otherReviewer ? formatReviewer(otherReviewer) : 'No one else is available'} |
+
+If you'd like the [reviewer roulette job](${process.env.CI_JOB_URL}) that generated this message to get two new random approvers check the box below and rerun it in the pipeline.
+- [ ] Give me two new approvers on the next push / job retry
+
+How do I review / What do I do if I've been named as a reviewer? An official guide is coming very soon, in the mean time pair up with the Senior Developer reviewer and ask for some tips if you'd like some guidance.
+`
+
+  const { present: actionPresentTense, past: actionPastTense } = previousNote
+    ? { present: 'Replacing', past: 'Replaced' }
+    : { present: 'Creating new', past: 'Created new' }
+
+  console.log(`${actionPresentTense} note...`)
+
+  const method = previousNote ? 'PUT' : 'POST'
+  const urlPrefix = previousNote
+    ? `${gitlabApiUrl}/api/v4/projects/${ciProjectId}/merge_requests/${ciMergeRequestIId}/notes/${previousNote.id}`
+    : `${gitlabApiUrl}/api/v4/projects/${ciProjectId}/merge_requests/${ciMergeRequestIId}/notes`
+
+  const writeResponse = await fetch(`${urlPrefix}?body=${encodeURIComponent(gitlabCommentBody)}`, {
+    headers: gitlabAuthHeaders,
+    method: method,
+  })
+
+  if (!writeResponse.ok) {
+    console.error(`GitLab API error: ${writeResponse.status} ${writeResponse.statusText}`)
+    console.error(`Failed to ${method} the reviewer note. No reviewers have been requested.`)
+    process.exit(1)
+  }
+
+  const jsonData: NoteResponse = await writeResponse.json()
+  console.log(`${actionPastTense} comment id = ${jsonData.id}`)
 }
 
 runReviewRoulette()
