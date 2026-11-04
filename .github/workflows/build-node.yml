@@ -31,6 +31,8 @@ jobs:
         key: npm-${{ hashFiles('package-lock.json') }}
         restore-keys: npm-
     - run: npm ci
+    - name: Check @types/node matches the pinned Node
+      run: node scripts/node-types-check.mjs
     - name: Lint
       run: npm run lint
     - name: Type-check
